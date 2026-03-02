@@ -7,7 +7,7 @@
 use crate::{schema::SchemaConfig, versioning::Migration};
 
 /// Postgres migration list. Append new migrations here.
-pub(crate) static POSTGRES_MIGRATIONS: [Migration; 2] = [
+pub(crate) static POSTGRES_MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 1,
         description: "Add safety_identifier column to responses",
@@ -17,6 +17,12 @@ pub(crate) static POSTGRES_MIGRATIONS: [Migration; 2] = [
         version: 2,
         description: "Remove legacy user_id column from responses",
         up: pg_v2_up,
+    },
+    Migration {
+        version: 3,
+        description:
+            "Drop redundant output, metadata, instructions, tool_calls columns from responses",
+        up: pg_v3_up,
     },
 ];
 
@@ -47,6 +53,41 @@ fn pg_v2_up(schema: &SchemaConfig) -> Vec<String> {
     }
     let table = s.qualified_table(schema.owner.as_deref());
     vec![format!("ALTER TABLE {table} DROP COLUMN IF EXISTS user_id")]
+}
+
+/// Drop the four redundant columns (output, metadata, instructions, tool_calls)
+/// that are now fully covered by `raw_response`.
+fn pg_v3_up(schema: &SchemaConfig) -> Vec<String> {
+    let s = &schema.responses;
+    let table = s.qualified_table(schema.owner.as_deref());
+
+    // Resolve each redundant field to its physical column name, then drop it.
+    // Skip if another field maps to the same physical name or it's an extra column.
+    let redundant = ["output", "metadata", "instructions", "tool_calls"];
+
+    let cols_to_drop: Vec<_> = redundant
+        .iter()
+        .filter_map(|&field| {
+            let col = s.col(field);
+            let mapped_by_non_redundant_field = s.columns.iter().any(|(k, v)| {
+                !k.eq_ignore_ascii_case(field)
+                    && !redundant.iter().any(|r| k.eq_ignore_ascii_case(r))
+                    && v.eq_ignore_ascii_case(col)
+            });
+            let used_as_extra = s.extra_columns.keys().any(|k| k.eq_ignore_ascii_case(col));
+            if mapped_by_non_redundant_field || used_as_extra {
+                None
+            } else {
+                Some(format!("DROP COLUMN IF EXISTS {col}"))
+            }
+        })
+        .collect();
+
+    if cols_to_drop.is_empty() {
+        return vec![];
+    }
+
+    vec![format!("ALTER TABLE {table} {}", cols_to_drop.join(", "))]
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -117,6 +158,73 @@ mod tests {
         assert!(
             stmts.is_empty(),
             "should skip drop when user_id is an extra column"
+        );
+    }
+
+    #[test]
+    fn pg_v3_up_generates_one_drop_statement() {
+        let schema = SchemaConfig::default();
+        let stmts = pg_v3_up(&schema);
+        assert_eq!(stmts.len(), 1);
+        let stmt = &stmts[0];
+        assert!(stmt.contains("DROP COLUMN IF EXISTS output"));
+        assert!(stmt.contains("DROP COLUMN IF EXISTS metadata"));
+        assert!(stmt.contains("DROP COLUMN IF EXISTS instructions"));
+        assert!(stmt.contains("DROP COLUMN IF EXISTS tool_calls"));
+    }
+
+    #[test]
+    fn pg_v3_up_skips_when_output_is_used_by_another_field() {
+        let mut schema = SchemaConfig::default();
+        // Another field maps to physical column "output"
+        schema
+            .responses
+            .columns
+            .insert("safety_identifier".to_string(), "output".to_string());
+        let stmts = pg_v3_up(&schema);
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            !stmts[0].contains("EXISTS output"),
+            "should skip output when another field maps to it: {stmts:?}"
+        );
+        assert!(stmts[0].contains("metadata"));
+    }
+
+    #[test]
+    fn pg_v3_up_skips_extra_column_named_metadata() {
+        let mut schema = SchemaConfig::default();
+        schema.responses.extra_columns.insert(
+            "metadata".to_string(),
+            crate::schema::ColumnDef {
+                sql_type: "JSON".to_string(),
+                default_value: None,
+            },
+        );
+        let stmts = pg_v3_up(&schema);
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            !stmts[0].contains("metadata"),
+            "should skip metadata when it's an extra column: {stmts:?}"
+        );
+        assert!(stmts[0].contains("output"));
+    }
+
+    #[test]
+    fn pg_v3_up_drops_mapped_physical_column_name() {
+        let mut schema = SchemaConfig::default();
+        schema
+            .responses
+            .columns
+            .insert("output".to_string(), "resp_output".to_string());
+        let stmts = pg_v3_up(&schema);
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].contains("resp_output"),
+            "should drop mapped physical column: {stmts:?}"
+        );
+        assert!(
+            !stmts[0].contains("EXISTS output"),
+            "should not use logical name: {stmts:?}"
         );
     }
 }
