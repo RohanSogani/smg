@@ -197,6 +197,41 @@ impl ProviderType {
         }
     }
 
+    /// Detect provider from URL host.
+    /// Returns `None` for URLs that don't match known providers or can't be parsed.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let host = url::Url::parse(url).ok()?.host_str()?.to_lowercase();
+
+        if host.ends_with("openai.com") {
+            Some(Self::OpenAI)
+        } else if host.ends_with("x.ai") {
+            Some(Self::XAI)
+        } else if host.ends_with("anthropic.com") {
+            Some(Self::Anthropic)
+        } else if host.ends_with("googleapis.com") {
+            Some(Self::Gemini)
+        } else {
+            None
+        }
+    }
+
+    /// Environment variable name for per-provider admin API key (model discovery).
+    /// Returns `None` for `Custom` providers since there's no known env var.
+    pub fn admin_key_env_var(&self) -> Option<&'static str> {
+        match self {
+            Self::OpenAI => Some("OPENAI_ADMIN_KEY"),
+            Self::XAI => Some("XAI_ADMIN_KEY"),
+            Self::Anthropic => Some("ANTHROPIC_ADMIN_KEY"),
+            Self::Gemini => Some("GEMINI_ADMIN_KEY"),
+            Self::Custom(_) => None,
+        }
+    }
+
+    /// Whether this provider uses `x-api-key` header instead of `Authorization: Bearer`.
+    pub fn uses_x_api_key(&self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+
     /// Detect provider from model name (heuristic fallback).
     /// Returns `None` for models that don't match known external providers.
     pub fn from_model_name(model: &str) -> Option<Self> {
