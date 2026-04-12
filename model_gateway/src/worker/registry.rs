@@ -17,6 +17,7 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
+use openai_protocol::worker::WorkerStatus;
 use parking_lot::RwLock;
 use smg_mesh::OptionalMeshSyncManager;
 use tokio::sync::broadcast;
@@ -991,13 +992,13 @@ impl WorkerRegistry {
                         .collect();
                     let checked_workers = futures::future::join_all(futs).await;
 
-                    // Only remove workers whose health check actually failed
-                    // this tick. Workers that are unhealthy but passing checks
-                    // (e.g. mesh-synced, pre-activation) are recovering — leave
-                    // them alone until they either become healthy or truly fail.
+                    // Only remove Failed workers — not Pending (still starting)
+                    // or NotReady (may recover). Failed is terminal, so we
+                    // don't gate on *failed (a worker can reach Failed via
+                    // max_pending_probes on a probe that returned Ok(false)).
                     if let Some(ref job_queue) = job_queue {
-                        for (worker, failed) in &checked_workers {
-                            if !worker.is_healthy() && *failed {
+                        for (worker, _failed) in &checked_workers {
+                            if worker.status() == WorkerStatus::Failed {
                                 let url = worker.url().to_string();
                                 tracing::warn!(
                                     worker_url = %url,
@@ -1229,17 +1230,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_checker_removes_unhealthy_workers() {
+    async fn test_pending_worker_stays_pending_under_failed_probes() {
         use openai_protocol::worker::HealthCheckConfig;
 
+        // Pending workers do NOT transition to NotReady on failed probes —
+        // they stay Pending until either `success_threshold` consecutive
+        // successes (→Ready) or `max_pending_probes` total attempts (→Failed).
+        // This test verifies the Pending state is sticky during early failures.
         let registry = WorkerRegistry::new();
 
-        // Worker pointing at a non-existent URL so health checks fail immediately.
-        // failure_threshold=1 so it becomes unhealthy after the first failed check.
         let mut labels = HashMap::new();
         labels.insert("model_id".to_string(), "test-model".to_string());
 
-        let worker: Box<dyn Worker> = Box::new(
+        let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:1")
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
@@ -1252,29 +1255,73 @@ mod tests {
                 })
                 .build(),
         );
+        assert_eq!(worker.status(), WorkerStatus::Pending);
 
-        registry.register(Arc::from(worker)).unwrap();
-        assert_eq!(registry.stats().total_workers, 1);
-
-        // Start health checker with remove_unhealthy=true but no job queue.
-        // Without a job queue the removal job can't be submitted, but the worker
-        // should still be marked unhealthy by the health check.
+        registry.register(worker.clone()).unwrap();
         let _hc = registry.start_health_checker(1, true, None);
 
-        // Wait for the health check to run and mark the worker unhealthy
+        // Wait for a few probe attempts. With check_interval=1 and a
+        // non-existent URL, probes will fail. With failure_threshold=1,
+        // max_pending_probes is 10 — so after ~3s we expect Pending still.
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
+        let stats = registry.stats();
+        assert_eq!(stats.total_workers, 1);
+        assert_eq!(stats.healthy_workers, 0, "Pending workers are not healthy");
+        // Worker should still be Pending — not yet Failed (max_pending_probes
+        // is 10, we've only run ~3 probes) and not NotReady (Pending workers
+        // don't transition to NotReady on failure).
+        let after = registry.get_by_url("http://127.0.0.1:1").unwrap();
         assert_eq!(
-            registry.stats().healthy_workers,
-            0,
-            "Worker should be marked unhealthy after failed health checks"
+            after.status(),
+            WorkerStatus::Pending,
+            "Pending should be sticky under early failures"
         );
     }
 
-    #[tokio::test]
-    async fn test_health_checker_keeps_unhealthy_workers_when_disabled() {
+    #[test]
+    fn test_failed_worker_can_be_removed_from_registry() {
+        // Drives the removal-on-Failed logic without needing the async
+        // health checker loop or a JobQueue. Verifies that the registry
+        // accepts removal of a Failed worker via remove() and that the
+        // worker is gone afterward.
         use openai_protocol::worker::HealthCheckConfig;
 
+        let registry = WorkerRegistry::new();
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://failed:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        );
+        let worker_id = registry.register(worker.clone()).unwrap();
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+
+        // Simulate the state machine reaching Failed.
+        worker.set_status(WorkerStatus::Failed);
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Failed
+        );
+
+        // The health checker's removal loop only acts on workers in Failed state.
+        // Verify we can remove a Failed worker through the standard remove() API
+        // (which is what Job::RemoveWorker eventually invokes).
+        assert!(registry.remove(&worker_id).is_some());
+        assert!(registry.get(&worker_id).is_none());
+        assert_eq!(registry.stats().total_workers, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_keeps_workers_when_remove_unhealthy_disabled() {
+        use openai_protocol::worker::HealthCheckConfig;
+
+        // When --remove-unhealthy-workers is false, workers in any state
+        // (Pending, NotReady, Failed) should remain in the registry.
         let registry = WorkerRegistry::new();
 
         let mut labels = HashMap::new();
@@ -1297,7 +1344,7 @@ mod tests {
         registry.register(Arc::from(worker)).unwrap();
         assert_eq!(registry.stats().total_workers, 1);
 
-        // Start health checker with remove_unhealthy=false (default behavior)
+        // Start health checker with remove_unhealthy=false
         let _hc = registry.start_health_checker(1, false, None);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -1419,6 +1466,65 @@ mod tests {
         assert!(registry.get_by_model("gpt-4o").is_empty());
         assert_eq!(registry.get_by_model("o3").len(), 1);
         assert_eq!(registry.get_by_model("o4-mini").len(), 1);
+    }
+
+    #[test]
+    fn test_builder_status_override_on_replace() {
+        // Regression test: metadata-only updates must not kick a healthy
+        // worker back to Pending. The builder exposes a `.status()` setter
+        // so callers (e.g. UpdateWorkerPropertiesStep) can pass the old
+        // worker's status when constructing the replacement.
+        let registry = WorkerRegistry::new();
+
+        // First worker starts Pending (health checks enabled by default),
+        // then gets promoted to Ready (simulating what the health checker does).
+        let first: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("llama-3"))
+                .build(),
+        );
+        assert_eq!(first.status(), WorkerStatus::Pending);
+        first.set_status(WorkerStatus::Ready);
+
+        let first_id = registry.register(first.clone()).unwrap();
+        assert_eq!(
+            registry.get(&first_id).unwrap().status(),
+            WorkerStatus::Ready
+        );
+
+        // Caller (e.g. UpdateWorkerPropertiesStep) reads the old status and
+        // passes it to the builder. The builder honors the override instead
+        // of defaulting to Pending.
+        let preserved_status = first.status();
+        let second: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("llama-3"))
+                .priority(99)
+                .status(preserved_status)
+                .build(),
+        );
+        assert_eq!(
+            second.status(),
+            WorkerStatus::Ready,
+            "builder must honor explicit status override"
+        );
+
+        assert!(registry.replace(&first_id, second));
+
+        let after = registry.get(&first_id).unwrap();
+        assert_eq!(after.status(), WorkerStatus::Ready);
+        assert_eq!(after.priority(), 99, "new priority should be applied");
+    }
+
+    #[test]
+    fn test_builder_default_status_is_pending() {
+        // Without an explicit override, health-checked workers start Pending.
+        let worker = BasicWorkerBuilder::new("http://worker:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
+        assert_eq!(worker.status(), WorkerStatus::Pending);
     }
 
     #[test]
