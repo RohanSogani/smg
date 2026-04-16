@@ -5,10 +5,17 @@
 //! - `StreamNamespace` for ephemeral, lossy, application-regenerated traffic (tenant deltas, tree repair)
 //!
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry as DashMapEntry, DashMap};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
@@ -194,11 +201,12 @@ impl DrainRegistry {
     }
 
     fn register(&self, prefix: &str, drain: StreamDrainFn) {
+        let entry = self.drains.entry(prefix.to_string());
         assert!(
-            !self.drains.contains_key(prefix),
+            matches!(&entry, DashMapEntry::Vacant(_)),
             "drain already registered for prefix '{prefix}'"
         );
-        self.drains.insert(prefix.to_string(), Arc::new(drain));
+        entry.or_insert(Arc::new(drain));
     }
 
     fn remove(&self, prefix: &str) {
@@ -207,7 +215,6 @@ impl DrainRegistry {
 
     /// Call all registered drains. Returns accumulated entries.
     /// Called exactly once per gossip round.
-    #[expect(dead_code)] // Called by centralized gossip loop in Step 2
     fn drain_all(&self) -> Vec<(String, Vec<u8>)> {
         let mut all_entries = Vec::new();
         for entry in &self.drains {
@@ -326,34 +333,18 @@ impl CrdtNamespace {
 pub struct StreamNamespace {
     prefix: String,
     routing: StreamRouting,
-    #[expect(dead_code)] // Used for backpressure enforcement in Step 2
     max_buffer_bytes: usize,
-    /// Ephemeral send buffer, drained every gossip round.
-    buffer: Arc<DashMap<String, Bytes>>,
-    /// Targeted entries: (target_peer_id, key, value).
-    targeted_buffer: Arc<parking_lot::Mutex<Vec<(String, String, Bytes)>>>,
+    /// Targeted entries: (target_peer_id, key, value). VecDeque for O(1) FIFO eviction.
+    targeted_buffer: parking_lot::Mutex<VecDeque<(String, String, Bytes)>>,
+    /// Current total bytes in the targeted buffer.
+    targeted_buffer_bytes: AtomicUsize,
     subscriber_registry: Arc<SubscriberRegistry>,
     drain_registry: Arc<DrainRegistry>,
 }
 
 impl StreamNamespace {
-    /// Publish a value to all connected peers (Broadcast namespaces only).
-    pub fn publish(&self, key: &str, value: Bytes) {
-        assert_eq!(
-            self.routing,
-            StreamRouting::Broadcast,
-            "publish() is only valid on Broadcast namespaces, not Targeted (prefix: '{}')",
-            self.prefix
-        );
-        assert!(
-            key.starts_with(&self.prefix),
-            "key '{key}' does not match prefix '{}'",
-            self.prefix
-        );
-        self.buffer.insert(key.to_string(), value);
-    }
-
     /// Publish a value to exactly one peer (Targeted namespaces only).
+    /// If the buffer exceeds `max_buffer_bytes`, the oldest entries are dropped.
     pub fn publish_to(&self, peer_id: &str, key: &str, value: Bytes) {
         assert_eq!(
             self.routing,
@@ -366,9 +357,20 @@ impl StreamNamespace {
             "key '{key}' does not match prefix '{}'",
             self.prefix
         );
-        self.targeted_buffer
-            .lock()
-            .push((peer_id.to_string(), key.to_string(), value));
+        let value_len = value.len();
+        let mut buf = self.targeted_buffer.lock();
+        buf.push_back((peer_id.to_string(), key.to_string(), value));
+        self.targeted_buffer_bytes
+            .fetch_add(value_len, Ordering::Relaxed);
+        // Drop the oldest entries (FIFO) while over limit. O(1) per pop_front.
+        while self.targeted_buffer_bytes.load(Ordering::Relaxed) > self.max_buffer_bytes
+            && !buf.is_empty()
+        {
+            if let Some((_, _, dropped)) = buf.pop_front() {
+                self.targeted_buffer_bytes
+                    .fetch_sub(dropped.len(), Ordering::Relaxed);
+            }
+        }
     }
 
     /// Subscribe to messages for keys matching a sub-prefix within this namespace.
@@ -381,14 +383,29 @@ impl StreamNamespace {
     }
 
     /// Register a drain callback. Called exactly once per gossip round by the
-    /// centralized collector. Returns a DrainHandle for
-    /// unregistration.
+    /// centralized collector. Only valid on Broadcast namespaces — drain entries
+    /// carry (key, value) without peer_id, so targeted routing is not possible.
+    /// Returns a DrainHandle for unregistration.
     pub fn register_drain(&self, drain: StreamDrainFn) -> DrainHandle {
+        assert_eq!(
+            self.routing,
+            StreamRouting::Broadcast,
+            "register_drain() is only valid on Broadcast namespaces (prefix: '{}')",
+            self.prefix
+        );
         self.drain_registry.register(&self.prefix, drain);
         DrainHandle {
             prefix: self.prefix.clone(),
             drain_registry: self.drain_registry.clone(),
         }
+    }
+
+    /// Drain all targeted buffer entries. Returns (peer_id, key, value) tuples
+    /// and resets the buffer. Called by the gossip loop once per round.
+    pub fn drain_targeted_buffer(&self) -> Vec<(String, String, Bytes)> {
+        let mut buf = self.targeted_buffer.lock();
+        self.targeted_buffer_bytes.store(0, Ordering::Relaxed);
+        std::mem::take(&mut *buf).into()
     }
 
     /// Get the routing mode for this namespace.
@@ -406,6 +423,16 @@ impl StreamNamespace {
 // MeshKV
 // ============================================================================
 
+/// A batch of entries collected once per gossip round by the central collector.
+#[derive(Debug)]
+pub struct RoundBatch {
+    /// Targeted stream entries: (peer_id, key, value). Sent to one specific peer.
+    pub targeted_entries: Vec<(String, String, Bytes)>,
+    /// Entries from registered drain callbacks (e.g., TreeSyncAdapter pending deltas).
+    /// Broadcast traffic (td:*) flows through this path, not through a buffer.
+    pub drain_entries: Vec<(String, Vec<u8>)>,
+}
+
 /// Generic, application-agnostic mesh transport. Provides explicit namespace
 /// handles for CRDT and stream modes. Application code MUST use namespace
 /// handles, not MeshKV directly.
@@ -414,6 +441,8 @@ pub struct MeshKV {
     store: Arc<CrdtOrMap>,
     /// Tracks configured prefixes to enforce fail-closed semantics.
     configured_prefixes: RwLock<HashMap<String, StoreMode>>,
+    /// Stream namespaces, stored for round batch collection.
+    stream_namespaces: RwLock<Vec<Arc<StreamNamespace>>>,
     /// Shared subscriber registry.
     subscriber_registry: Arc<SubscriberRegistry>,
     /// Shared drain registry.
@@ -431,6 +460,7 @@ impl MeshKV {
         Self {
             store: Arc::new(CrdtOrMap::new()),
             configured_prefixes: RwLock::new(HashMap::new()),
+            stream_namespaces: RwLock::new(Vec::new()),
             subscriber_registry: Arc::new(SubscriberRegistry::new()),
             drain_registry: Arc::new(DrainRegistry::new()),
             server_name,
@@ -504,15 +534,17 @@ impl MeshKV {
             );
         }
 
-        Arc::new(StreamNamespace {
+        let ns = Arc::new(StreamNamespace {
             prefix: prefix.to_string(),
             routing: config.routing,
             max_buffer_bytes: config.max_buffer_bytes,
-            buffer: Arc::new(DashMap::new()),
-            targeted_buffer: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            targeted_buffer: parking_lot::Mutex::new(VecDeque::new()),
+            targeted_buffer_bytes: AtomicUsize::new(0),
             subscriber_registry: self.subscriber_registry.clone(),
             drain_registry: self.drain_registry.clone(),
-        })
+        });
+        self.stream_namespaces.write().push(ns.clone());
+        ns
     }
 
     /// Get the server name for this node.
@@ -523,6 +555,27 @@ impl MeshKV {
     /// Get the replica ID for this node.
     pub fn replica_id(&self) -> u64 {
         self.replica_id
+    }
+
+    /// Collect all stream entries for one gossip round. Called exactly once
+    /// per round by the centralized gossip loop. Drains all stream buffers
+    /// and calls all registered drain callbacks.
+    pub fn collect_round_batch(&self) -> RoundBatch {
+        let mut targeted_entries = Vec::new();
+
+        // Drain targeted stream namespace buffers.
+        for ns in self.stream_namespaces.read().iter() {
+            targeted_entries.extend(ns.drain_targeted_buffer());
+        }
+
+        // Call registered drain callbacks (e.g., TreeSyncAdapter pending deltas).
+        // Broadcast traffic (td:*) flows through this path.
+        let drain_entries = self.drain_registry.drain_all();
+
+        RoundBatch {
+            targeted_entries,
+            drain_entries,
+        }
     }
 
     /// Check if a prefix has been configured.
@@ -642,20 +695,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only valid on Broadcast")]
-    fn test_stream_publish_on_targeted_panics() {
-        let kv = MeshKV::new("test-node".to_string());
-        let ns = kv.configure_stream_prefix(
-            "tree:req:",
-            StreamConfig {
-                max_buffer_bytes: 1024,
-                routing: StreamRouting::Targeted,
-            },
-        );
-        ns.publish("tree:req:model-x", Bytes::from("data")); // panics
-    }
-
-    #[test]
     #[should_panic(expected = "only valid on Targeted")]
     fn test_stream_publish_to_on_broadcast_panics() {
         let kv = MeshKV::new("test-node".to_string());
@@ -710,5 +749,114 @@ mod tests {
             .expect("channel closed");
         assert_eq!(key, "worker:7");
         assert!(value.is_none(), "delete should notify with None");
+    }
+
+    #[test]
+    fn test_targeted_backpressure_drops_oldest() {
+        let kv = MeshKV::new("test-node".to_string());
+        let ns = kv.configure_stream_prefix(
+            "tree:page:",
+            StreamConfig {
+                max_buffer_bytes: 20, // tiny limit
+                routing: StreamRouting::Targeted,
+            },
+        );
+
+        ns.publish_to("peer-A", "tree:page:m1", Bytes::from("aaaaaaaaaa")); // 10 bytes
+        ns.publish_to("peer-A", "tree:page:m2", Bytes::from("bbbbbbbbbb")); // 10 bytes
+        ns.publish_to("peer-A", "tree:page:m3", Bytes::from("cccccccccc")); // over limit
+
+        let drained = ns.drain_targeted_buffer();
+        let total_bytes: usize = drained.iter().map(|(_, _, v)| v.len()).sum();
+        assert!(
+            total_bytes <= 20,
+            "buffer should be within limit, got {total_bytes}"
+        );
+        // Oldest entry (m1) should have been dropped, keeping m2 and m3.
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].1, "tree:page:m2");
+        assert_eq!(drained[1].1, "tree:page:m3");
+    }
+
+    #[test]
+    fn test_drain_targeted_buffer() {
+        let kv = MeshKV::new("test-node".to_string());
+        let ns = kv.configure_stream_prefix(
+            "tree:page:",
+            StreamConfig {
+                max_buffer_bytes: 1024,
+                routing: StreamRouting::Targeted,
+            },
+        );
+
+        ns.publish_to("peer-A", "tree:page:m1", Bytes::from("page1"));
+        ns.publish_to("peer-B", "tree:page:m2", Bytes::from("page2"));
+
+        let entries = ns.drain_targeted_buffer();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "peer-A");
+        assert_eq!(entries[1].0, "peer-B");
+
+        // Buffer should be empty after drain.
+        let entries2 = ns.drain_targeted_buffer();
+        assert!(entries2.is_empty());
+    }
+
+    #[test]
+    fn test_collect_round_batch() {
+        let kv = MeshKV::new("test-node".to_string());
+        let targeted_ns = kv.configure_stream_prefix(
+            "tree:page:",
+            StreamConfig {
+                max_buffer_bytes: 1024,
+                routing: StreamRouting::Targeted,
+            },
+        );
+
+        targeted_ns.publish_to("peer-A", "tree:page:m1", Bytes::from("page"));
+
+        let batch = kv.collect_round_batch();
+        assert_eq!(batch.targeted_entries.len(), 1);
+        assert_eq!(batch.targeted_entries[0].0, "peer-A");
+
+        // Second collect should be empty (buffers drained).
+        let batch2 = kv.collect_round_batch();
+        assert!(batch2.targeted_entries.is_empty());
+    }
+
+    #[test]
+    fn test_collect_round_batch_with_drain_callback() {
+        let kv = MeshKV::new("test-node".to_string());
+        let ns = kv.configure_stream_prefix(
+            "td:",
+            StreamConfig {
+                max_buffer_bytes: 1024,
+                routing: StreamRouting::Broadcast,
+            },
+        );
+
+        let _handle = ns.register_drain(Box::new(|| {
+            vec![("td:from-drain".to_string(), b"drain-data".to_vec())]
+        }));
+
+        let batch = kv.collect_round_batch();
+        assert_eq!(batch.drain_entries.len(), 1);
+        assert_eq!(batch.drain_entries[0].0, "td:from-drain");
+    }
+
+    #[test]
+    #[should_panic(expected = "drain already registered")]
+    fn test_duplicate_drain_registration_panics() {
+        let kv = MeshKV::new("test-node".to_string());
+        let ns = kv.configure_stream_prefix(
+            "td:",
+            StreamConfig {
+                max_buffer_bytes: 1024,
+                routing: StreamRouting::Broadcast,
+            },
+        );
+
+        let _h1 = ns.register_drain(Box::new(Vec::new));
+        let _h2 = ns.register_drain(Box::new(Vec::new)); // panics
     }
 }
