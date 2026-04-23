@@ -1,6 +1,6 @@
 //! Utility functions for /v1/responses endpoint
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::response::Response;
 use openai_protocol::{
@@ -59,7 +59,7 @@ pub(crate) async fn ensure_mcp_connection(
     }
 
     if let Some(tools) = tools {
-        match ensure_request_mcp_client(mcp_orchestrator, tools).await {
+        match ensure_request_mcp_client(mcp_orchestrator, tools, &HashMap::new()).await {
             Some(mcp_servers) => {
                 return Ok((true, mcp_servers));
             }

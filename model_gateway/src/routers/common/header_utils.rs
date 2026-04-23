@@ -292,19 +292,27 @@ pub fn extract_forwardable_request_headers(headers: Option<&HeaderMap>) -> HashM
         return HashMap::new();
     };
 
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            if !should_forward_request_header(name.as_str()) {
-                return None;
-            }
+    let mut forwarded = HashMap::new();
 
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_string(), v.to_string()))
-        })
-        .collect()
+    for (name, value) in headers {
+        if !should_forward_request_header(name.as_str()) {
+            continue;
+        }
+
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+
+        forwarded
+            .entry(name.as_str().to_string())
+            .and_modify(|existing: &mut String| {
+                existing.push_str(", ");
+                existing.push_str(value);
+            })
+            .or_insert_with(|| value.to_string());
+    }
+
+    forwarded
 }
 
 #[inline]
@@ -490,6 +498,20 @@ mod tests {
         );
         assert_eq!(forwarded.get("x-request-id"), Some(&"req-123".to_string()));
         assert!(!forwarded.contains_key("x-custom-header"));
+    }
+
+    #[test]
+    fn test_extract_forwardable_request_headers_preserves_repeated_values() {
+        let mut headers = HeaderMap::new();
+        headers.append("tracestate", "vendor1=value1".parse().unwrap());
+        headers.append("tracestate", "vendor2=value2".parse().unwrap());
+
+        let forwarded = extract_forwardable_request_headers(Some(&headers));
+
+        assert_eq!(
+            forwarded.get("tracestate"),
+            Some(&"vendor1=value1, vendor2=value2".to_string())
+        );
     }
 
     #[test]
