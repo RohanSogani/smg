@@ -11,7 +11,10 @@ use smg_data_connector::{
 };
 use smg_mcp::{McpOrchestrator, McpToolSession};
 
-use super::provider::Provider;
+use super::{
+    provider::Provider,
+    stateful_tools::{SharedStatefulToolBootstrapper, StatefulToolBootstrapState},
+};
 use crate::{
     config::RouterConfig, memory::MemoryExecutionContext, middleware,
     middleware::TenantRequestMeta, worker::Worker,
@@ -47,6 +50,7 @@ pub struct SharedComponents {
 pub struct ResponsesComponents {
     pub shared: Arc<SharedComponents>,
     pub mcp_orchestrator: Arc<McpOrchestrator>,
+    pub stateful_tool_bootstrapper: SharedStatefulToolBootstrapper,
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
@@ -85,6 +89,13 @@ impl ComponentRefs {
         match self {
             ComponentRefs::Shared(_) => None,
             ComponentRefs::Responses(r) => Some(&r.response_storage),
+        }
+    }
+
+    pub fn stateful_tool_bootstrapper(&self) -> Option<&SharedStatefulToolBootstrapper> {
+        match self {
+            ComponentRefs::Shared(_) => None,
+            ComponentRefs::Responses(r) => Some(&r.stateful_tool_bootstrapper),
         }
     }
 
@@ -132,6 +143,7 @@ pub struct PayloadState {
 pub struct ResponsesPayloadState {
     pub previous_response_id: Option<String>,
     pub existing_mcp_list_tools_labels: Vec<String>,
+    pub stateful_tool_bootstrap: StatefulToolBootstrapState,
 }
 
 impl RequestContext {
@@ -268,6 +280,7 @@ pub struct OwnedStreamingContext {
     pub original_body: ResponsesRequest,
     pub previous_response_id: Option<String>,
     pub existing_mcp_list_tools_labels: Vec<String>,
+    pub stateful_tool_bootstrap: StatefulToolBootstrapState,
     pub storage: StorageHandles,
 }
 
@@ -306,6 +319,7 @@ impl RequestContext {
             original_body,
             previous_response_id: responses_payload_state.previous_response_id,
             existing_mcp_list_tools_labels: responses_payload_state.existing_mcp_list_tools_labels,
+            stateful_tool_bootstrap: responses_payload_state.stateful_tool_bootstrap,
             storage: StorageHandles {
                 response,
                 conversation,

@@ -41,6 +41,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
     let ResponsesPayloadState {
         previous_response_id,
         existing_mcp_list_tools_labels,
+        stateful_tool_bootstrap: _stateful_tool_bootstrap,
     } = ctx.take_responses_payload().unwrap_or_default();
 
     let original_body = match ctx.responses_request() {
