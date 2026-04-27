@@ -13,7 +13,7 @@ use serde_json::to_value;
 use super::{
     super::{
         context::{
-            ComponentRefs, PayloadState, RequestContext, ResponsesComponents,
+            ComponentRefs, PayloadState, RequestContext, RequestType, ResponsesComponents,
             ResponsesPayloadState, WorkerSelection,
         },
         provider::ProviderRegistry,
@@ -134,7 +134,7 @@ pub(in crate::routers::openai) async fn route_responses(
     }
 
     let mut ctx = RequestContext::for_responses(
-        Arc::new(body.clone()),
+        Arc::new(request_body.clone()),
         headers.cloned(),
         Some(model_id.to_string()),
         ComponentRefs::Responses(Arc::clone(deps.responses_components)),
@@ -200,6 +200,7 @@ pub(in crate::routers::openai) async fn route_responses(
             format!("Failed to prepare stateful tool request state: {e}"),
         );
     }
+    ctx.input.request_type = RequestType::Responses(Arc::new(request_body.clone()));
 
     request_body.store = Some(false);
     if let ResponseInput::Items(ref mut items) = request_body.input {

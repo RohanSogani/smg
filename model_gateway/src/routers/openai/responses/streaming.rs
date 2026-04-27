@@ -683,7 +683,7 @@ pub(super) fn handle_streaming_with_tool_interception(
     let original_request = req.original_body;
     let previous_response_id = req.previous_response_id;
     let existing_mcp_list_tools_labels = req.existing_mcp_list_tools_labels;
-    let _stateful_tool_bootstrap = req.stateful_tool_bootstrap;
+    let stateful_tool_bootstrap = req.stateful_tool_bootstrap;
     let url = req.url;
     let storage = req.storage;
 
@@ -699,9 +699,14 @@ pub(super) fn handle_streaming_with_tool_interception(
         reason = "fire-and-forget MCP tool loop; gateway shutdown need not wait for individual tool loops"
     )]
     tokio::spawn(async move {
-        let mut state = ToolLoopState::new(
+        let mut state = ToolLoopState::new_with_bootstrap(
             original_request.input.clone(),
             existing_mcp_list_tools_labels,
+            stateful_tool_bootstrap,
+        );
+        tracing::debug!(
+            prepared_stateful_tools = state.stateful_tool_bootstrap.prepared_tools.len(),
+            "Starting streaming tool loop"
         );
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 

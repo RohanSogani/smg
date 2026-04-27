@@ -23,7 +23,7 @@ use smg::{
         openai::{
             stateful_tools::{
                 PreparedToolState, StatefulToolBootstrapContext, StatefulToolBootstrapResult,
-                StatefulToolBootstrapState, StatefulToolBootstrapper, StatefulToolKind,
+                StatefulToolBootstrapper, StatefulToolKind,
             },
             OpenAIRouter,
         },
@@ -66,7 +66,7 @@ impl StatefulToolBootstrapper for TestBootstrapper {
         }
 
         Ok(StatefulToolBootstrapResult {
-            prepared_state: self.result.prepared_state.clone(),
+            prepared_tools: self.result.prepared_tools.clone(),
             injected_input_items: self.result.injected_input_items.clone(),
         })
     }
@@ -74,7 +74,7 @@ impl StatefulToolBootstrapper for TestBootstrapper {
 
 fn bootstrap_injected_message(text: &str) -> ResponseInputOutputItem {
     ResponseInputOutputItem::Message {
-        id: String::new(),
+        id: openai_protocol::responses::generate_id("msg"),
         role: "system".to_string(),
         content: vec![ResponseContentPart::InputText {
             text: text.to_string(),
@@ -138,6 +138,26 @@ fn non_stateful_tool_request() -> ResponsesRequest {
     }
 }
 
+fn stateful_tool_request_with_mcp(stream: bool, mcp_url: String) -> ResponsesRequest {
+    ResponsesRequest {
+        tools: Some(vec![
+            ResponseTool::Shell(ShellTool::default()),
+            ResponseTool::Mcp(McpTool {
+                server_url: Some(mcp_url),
+                authorization: None,
+                headers: None,
+                server_label: "mock".to_string(),
+                server_description: None,
+                require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+                allowed_tools: None,
+                connector_id: None,
+                defer_loading: None,
+            }),
+        ]),
+        ..stateful_tool_request(stream)
+    }
+}
+
 fn bootstrap_payload_texts(payload: &serde_json::Value) -> Vec<String> {
     payload
         .get("input")
@@ -184,19 +204,16 @@ async fn test_non_streaming_stateful_tool_bootstrap_injects_payload_before_worke
     let bootstrapper = Arc::new(TestBootstrapper {
         calls: Arc::clone(&calls),
         result: StatefulToolBootstrapResult {
-            prepared_state: StatefulToolBootstrapState {
-                executed: false,
-                prepared_tools: vec![
-                    PreparedToolState {
-                        kind: StatefulToolKind::Shell,
-                        value: serde_json::json!({ "container_id": "ctr-shell" }),
-                    },
-                    PreparedToolState {
-                        kind: StatefulToolKind::CodeInterpreter,
-                        value: serde_json::json!({ "container_id": "ctr-python" }),
-                    },
-                ],
-            },
+            prepared_tools: vec![
+                PreparedToolState {
+                    kind: StatefulToolKind::Shell,
+                    value: serde_json::json!({ "container_id": "ctr-shell" }),
+                },
+                PreparedToolState {
+                    kind: StatefulToolKind::CodeInterpreter,
+                    value: serde_json::json!({ "container_id": "ctr-python" }),
+                },
+            ],
             injected_input_items: vec![bootstrap_injected_message("bootstrap context")],
         },
         error: None,
@@ -247,13 +264,10 @@ async fn test_streaming_stateful_tool_bootstrap_injects_payload_before_worker_ca
     let bootstrapper = Arc::new(TestBootstrapper {
         calls: Arc::clone(&calls),
         result: StatefulToolBootstrapResult {
-            prepared_state: StatefulToolBootstrapState {
-                executed: false,
-                prepared_tools: vec![PreparedToolState {
-                    kind: StatefulToolKind::Shell,
-                    value: serde_json::json!({ "container_id": "ctr-shell" }),
-                }],
-            },
+            prepared_tools: vec![PreparedToolState {
+                kind: StatefulToolKind::Shell,
+                value: serde_json::json!({ "container_id": "ctr-shell" }),
+            }],
             injected_input_items: vec![bootstrap_injected_message("stream bootstrap context")],
         },
         error: None,
@@ -306,7 +320,7 @@ async fn test_router_skips_stateful_tool_bootstrap_when_request_has_no_stateful_
     let bootstrapper = Arc::new(TestBootstrapper {
         calls: Arc::clone(&calls),
         result: StatefulToolBootstrapResult {
-            prepared_state: StatefulToolBootstrapState::default(),
+            prepared_tools: Vec::new(),
             injected_input_items: vec![bootstrap_injected_message("should not be injected")],
         },
         error: None,
@@ -378,6 +392,160 @@ async fn test_stateful_tool_bootstrap_failure_short_circuits_before_worker_call(
     assert_eq!(body_json["error"]["code"], "stateful_tool_bootstrap_failed");
 
     worker.stop().await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_tool_loop_preserves_bootstrapped_input_on_resume() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let worker_port = worker.port().await;
+
+    let ctx = crate::common::create_test_context(standard_openai_router_config(worker_url)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bootstrapper = Arc::new(TestBootstrapper {
+        calls: Arc::clone(&calls),
+        result: StatefulToolBootstrapResult {
+            prepared_tools: vec![PreparedToolState {
+                kind: StatefulToolKind::Shell,
+                value: serde_json::json!({ "container_id": "ctr-shell" }),
+            }],
+            injected_input_items: vec![bootstrap_injected_message("bootstrap context")],
+        },
+        error: None,
+    });
+    let router = OpenAIRouter::new_with_stateful_tool_bootstrapper(&ctx, bootstrapper)
+        .await
+        .expect("router");
+
+    let req = stateful_tool_request_with_mcp(false, mcp.url());
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let requests = take_recorded_responses_requests_for_port(worker_port);
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial and resumed downstream worker calls"
+    );
+
+    assert_eq!(
+        bootstrap_payload_texts(&requests[0]),
+        vec![
+            "bootstrap context".to_string(),
+            "Run the stateful tool".to_string(),
+        ]
+    );
+    assert_eq!(
+        bootstrap_payload_texts(&requests[1]),
+        vec![
+            "bootstrap context".to_string(),
+            "Run the stateful tool".to_string(),
+        ],
+        "resume payload should preserve bootstrapped input items"
+    );
+    assert!(
+        requests[1]
+            .get("input")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(|value| value.as_str()) == Some("function_call_output")
+            })),
+        "resume payload should include function_call_output conversation history"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_streaming_tool_loop_preserves_bootstrapped_input_on_resume() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let worker_port = worker.port().await;
+
+    let ctx = crate::common::create_test_context(standard_openai_router_config(worker_url)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bootstrapper = Arc::new(TestBootstrapper {
+        calls: Arc::clone(&calls),
+        result: StatefulToolBootstrapResult {
+            prepared_tools: vec![PreparedToolState {
+                kind: StatefulToolKind::Shell,
+                value: serde_json::json!({ "container_id": "ctr-shell" }),
+            }],
+            injected_input_items: vec![bootstrap_injected_message("stream bootstrap context")],
+        },
+        error: None,
+    });
+    let router = OpenAIRouter::new_with_stateful_tool_bootstrapper(&ctx, bootstrapper)
+        .await
+        .expect("router");
+
+    let req = stateful_tool_request_with_mcp(true, mcp.url());
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, &req, req.model.as_str())
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read streaming body");
+    let body_text = String::from_utf8_lossy(&body_bytes);
+    assert!(body_text.contains("[DONE]"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let requests = take_recorded_responses_requests_for_port(worker_port);
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial and resumed downstream worker calls"
+    );
+    assert_eq!(
+        bootstrap_payload_texts(&requests[0]),
+        vec![
+            "stream bootstrap context".to_string(),
+            "Run the stateful tool".to_string(),
+        ]
+    );
+    assert_eq!(
+        bootstrap_payload_texts(&requests[1]),
+        vec![
+            "stream bootstrap context".to_string(),
+            "Run the stateful tool".to_string(),
+        ],
+        "streaming resume payload should preserve bootstrapped input items"
+    );
+    assert!(
+        requests[1]
+            .get("input")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| items.iter().any(|item| {
+                item.get("type").and_then(|value| value.as_str()) == Some("function_call_output")
+            })),
+        "streaming resume payload should include function_call_output conversation history"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
 }
 
 #[tokio::test]

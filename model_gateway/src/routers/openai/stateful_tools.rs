@@ -10,7 +10,8 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use openai_protocol::responses::{
-    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseTool, ResponsesRequest,
+    generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseTool,
+    ResponsesRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,7 +62,7 @@ impl StatefulToolBootstrapState {
 
 #[derive(Debug, Default)]
 pub struct StatefulToolBootstrapResult {
-    pub prepared_state: StatefulToolBootstrapState,
+    pub prepared_tools: Vec<PreparedToolState>,
     pub injected_input_items: Vec<ResponseInputOutputItem>,
 }
 
@@ -119,7 +120,7 @@ pub fn request_has_stateful_tools(request: &ResponsesRequest) -> bool {
 pub async fn ensure_stateful_tool_bootstrap(
     request: &mut ResponsesRequest,
     bootstrap_state: &mut StatefulToolBootstrapState,
-    bootstrapper: &(dyn StatefulToolBootstrapper + Send + Sync),
+    bootstrapper: &dyn StatefulToolBootstrapper,
     context: StatefulToolBootstrapContext<'_>,
 ) -> Result<(), String> {
     if bootstrap_state.executed || !request_has_stateful_tools(request) {
@@ -130,7 +131,7 @@ pub async fn ensure_stateful_tool_bootstrap(
     prepend_injected_items(&mut request.input, result.injected_input_items);
 
     bootstrap_state.executed = true;
-    for tool in result.prepared_state.prepared_tools {
+    for tool in result.prepared_tools {
         bootstrap_state.upsert_prepared_tool(tool.kind, tool.value);
     }
 
@@ -148,7 +149,7 @@ fn prepend_injected_items(
     match input {
         ResponseInput::Text(text) => {
             injected_items.push(ResponseInputOutputItem::Message {
-                id: String::new(),
+                id: generate_id("msg"),
                 role: "user".to_string(),
                 content: vec![ResponseContentPart::InputText { text: text.clone() }],
                 status: None,
@@ -163,7 +164,7 @@ fn prepend_injected_items(
     }
 }
 
-pub type SharedStatefulToolBootstrapper = Arc<dyn StatefulToolBootstrapper + Send + Sync>;
+pub type SharedStatefulToolBootstrapper = Arc<dyn StatefulToolBootstrapper>;
 
 #[cfg(test)]
 mod tests {
@@ -193,7 +194,7 @@ mod tests {
         ) -> Result<StatefulToolBootstrapResult, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(StatefulToolBootstrapResult {
-                prepared_state: self.result.prepared_state.clone(),
+                prepared_tools: self.result.prepared_tools.clone(),
                 injected_input_items: self.result.injected_input_items.clone(),
             })
         }
@@ -264,13 +265,10 @@ mod tests {
         let bootstrapper = CountingBootstrapper {
             calls: Arc::clone(&calls),
             result: StatefulToolBootstrapResult {
-                prepared_state: StatefulToolBootstrapState {
-                    executed: false,
-                    prepared_tools: vec![PreparedToolState {
-                        kind: StatefulToolKind::Shell,
-                        value: json!({"session_id": "sess_123"}),
-                    }],
-                },
+                prepared_tools: vec![PreparedToolState {
+                    kind: StatefulToolKind::Shell,
+                    value: json!({"session_id": "sess_123"}),
+                }],
                 injected_input_items: vec![ResponseInputOutputItem::Message {
                     id: "msg_bootstrap".to_string(),
                     role: "developer".to_string(),
