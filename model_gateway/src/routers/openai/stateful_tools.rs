@@ -202,6 +202,19 @@ mod tests {
         }
     }
 
+    struct FailingBootstrapper;
+
+    #[async_trait]
+    impl StatefulToolBootstrapper for FailingBootstrapper {
+        async fn bootstrap(
+            &self,
+            _request: &ResponsesRequest,
+            _context: StatefulToolBootstrapContext<'_>,
+        ) -> Result<StatefulToolBootstrapResult, String> {
+            Err("boom".to_string())
+        }
+    }
+
     fn bootstrap_context<'a>(
         memory_execution_context: &'a MemoryExecutionContext,
     ) -> StatefulToolBootstrapContext<'a> {
@@ -326,5 +339,34 @@ mod tests {
             &items[1],
             ResponseInputOutputItem::Message { role, .. } if role == "user"
         ));
+    }
+
+    #[tokio::test]
+    async fn ensure_stateful_tool_bootstrap_error_is_non_mutating() {
+        let memory_execution_context = MemoryExecutionContext::default();
+        let mut request = ResponsesRequest {
+            input: ResponseInput::Text("hello".to_string()),
+            tools: Some(vec![ResponseTool::Shell(ShellTool::default())]),
+            ..Default::default()
+        };
+        let original_input = serde_json::to_value(&request.input).expect("serialize input");
+        let mut bootstrap_state = StatefulToolBootstrapState::default();
+
+        let err = ensure_stateful_tool_bootstrap(
+            &mut request,
+            &mut bootstrap_state,
+            &FailingBootstrapper,
+            bootstrap_context(&memory_execution_context),
+        )
+        .await
+        .expect_err("bootstrap should fail");
+
+        assert_eq!(err, "boom");
+        assert!(!bootstrap_state.executed);
+        assert_eq!(
+            serde_json::to_value(&request.input).expect("serialize input"),
+            original_input
+        );
+        assert!(bootstrap_state.prepared_tools.is_empty());
     }
 }

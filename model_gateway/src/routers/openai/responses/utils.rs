@@ -27,7 +27,7 @@ fn is_missing_or_empty(value: Option<&Value>) -> bool {
 /// Provider execution uses `request_body` after history loading, bootstrap
 /// injection, `store=false`, and replay sanitization. Persistence needs that
 /// executed input, but it must retain caller-owned metadata such as
-/// `conversation` and `store` from `client_body`.
+/// `conversation`, `previous_response_id`, and `store` from `client_body`.
 pub(super) fn build_persistence_request_body(
     request_body: &ResponsesRequest,
     client_body: &ResponsesRequest,
@@ -43,6 +43,9 @@ pub(super) fn build_persistence_request_body(
     persistence_body
         .conversation
         .clone_from(&client_body.conversation);
+    persistence_body
+        .previous_response_id
+        .clone_from(&client_body.previous_response_id);
     persistence_body.store = client_body.store;
     persistence_body.user.clone_from(&client_body.user);
     persistence_body

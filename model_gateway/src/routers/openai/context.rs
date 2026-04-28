@@ -278,8 +278,8 @@ pub struct StorageHandles {
 pub struct OwnedStreamingContext {
     pub url: String,
     pub payload: Value,
-    pub request_body: ResponsesRequest,
-    pub client_body: ResponsesRequest,
+    pub request_body: Arc<ResponsesRequest>,
+    pub client_body: Arc<ResponsesRequest>,
     pub previous_response_id: Option<String>,
     pub existing_mcp_list_tools_labels: Vec<String>,
     pub stateful_tool_bootstrap: StatefulToolBootstrapState,
@@ -291,14 +291,11 @@ impl RequestContext {
         let payload_state = self.take_payload().ok_or("Payload not prepared")?;
         let responses_payload_state = self.take_responses_payload().unwrap_or_default();
         let request_body = self
-            .responses_request()
-            .ok_or("Expected responses request")?
-            .clone();
+            .responses_request_arc()
+            .ok_or("Expected responses request")?;
         let client_body = responses_payload_state
             .client_request
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| request_body.clone());
+            .unwrap_or_else(|| Arc::clone(&request_body));
         let response = self
             .components
             .response_storage()

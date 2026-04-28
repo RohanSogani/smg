@@ -362,6 +362,16 @@ mod tests {
 
     #[test]
     fn deserialize_items_from_array_drops_reasoning_replay_items() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": []
+        });
+        assert!(
+            serde_json::from_value::<ResponseInputOutputItem>(reasoning.clone()).is_ok(),
+            "reasoning fixture must deserialize so this test validates filtering logic"
+        );
+
         let items = json!([
             {
                 "type": "message",
@@ -370,12 +380,7 @@ mod tests {
                 "content": [{ "type": "input_text", "text": "hello" }],
                 "status": "completed"
             },
-            {
-                "type": "reasoning",
-                "id": "rs_1",
-                "content": [],
-                "status": "completed"
-            }
+            reasoning
         ]);
 
         let parsed = deserialize_items_from_array(&items);

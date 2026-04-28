@@ -133,8 +133,9 @@ pub(in crate::routers::openai) async fn route_responses(
         super::history::inject_memory_context(&memory_config, &mut request_body);
     }
 
+    let client_request = Arc::new(body.clone());
     let mut ctx = RequestContext::for_responses(
-        Arc::new(request_body.clone()),
+        Arc::clone(&client_request),
         headers.cloned(),
         Some(model_id.to_string()),
         ComponentRefs::Responses(Arc::clone(deps.responses_components)),
@@ -148,15 +149,58 @@ pub(in crate::routers::openai) async fn route_responses(
         provider: Arc::clone(&provider),
     });
     ctx.state.responses_payload = Some(ResponsesPayloadState {
-        client_request: Some(Arc::new(body.clone())),
+        client_request: Some(Arc::clone(&client_request)),
         previous_response_id: loaded_history.previous_response_id,
         existing_mcp_list_tools_labels: loaded_history.existing_mcp_list_tools_labels,
         ..Default::default()
     });
 
+    request_body.store = Some(false);
+    if let ResponseInput::Items(ref mut items) = request_body.input {
+        items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
+    }
+
+    let mut preflight_payload = match to_value(&request_body) {
+        Ok(v) => v,
+        Err(e) => {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_VALIDATION,
+            );
+            return error::bad_request(
+                "invalid_request",
+                format!("Failed to serialize request: {e}"),
+            );
+        }
+    };
+
+    if let Err(e) = provider.transform_request(&mut preflight_payload, Endpoint::Responses) {
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_OPENAI,
+            metrics_labels::BACKEND_EXTERNAL,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            metrics_labels::ENDPOINT_RESPONSES,
+            metrics_labels::ERROR_VALIDATION,
+        );
+        return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
+    }
+
     let stateful_tool_bootstrapper = match ctx.components.stateful_tool_bootstrapper() {
         Some(bootstrapper) => Arc::clone(bootstrapper),
         None => {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_INTERNAL,
+            );
             return error::internal_error(
                 "internal_error",
                 "Stateful tool bootstrapper not configured",
@@ -169,6 +213,14 @@ pub(in crate::routers::openai) async fn route_responses(
     let bootstrap_state = match ctx.state.responses_payload.as_mut() {
         Some(responses_payload) => &mut responses_payload.stateful_tool_bootstrap,
         None => {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_OPENAI,
+                metrics_labels::BACKEND_EXTERNAL,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                metrics_labels::ENDPOINT_RESPONSES,
+                metrics_labels::ERROR_INTERNAL,
+            );
             return error::internal_error(
                 "internal_error",
                 "Responses payload state not initialized",
@@ -201,7 +253,6 @@ pub(in crate::routers::openai) async fn route_responses(
             format!("Failed to prepare stateful tool request state: {e}"),
         );
     }
-    request_body.store = Some(false);
     if let ResponseInput::Items(ref mut items) = request_body.input {
         items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
     }

@@ -83,6 +83,7 @@ impl MockWorker {
         } else {
             port
         };
+        clear_recorded_responses_requests_for_port(port);
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -138,6 +139,9 @@ impl MockWorker {
 
     /// Stop the mock worker server
     pub async fn stop(&mut self) {
+        let port = self.config.read().await.port;
+        clear_recorded_responses_requests_for_port(port);
+
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
@@ -155,6 +159,10 @@ impl MockWorker {
 
 impl Drop for MockWorker {
     fn drop(&mut self) {
+        if let Ok(config) = self.config.try_read() {
+            clear_recorded_responses_requests_for_port(config.port);
+        }
+
         // Clean shutdown when dropped
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -1284,6 +1292,15 @@ fn record_responses_request_for_port(port: u16, payload: serde_json::Value) {
 pub fn take_recorded_responses_requests_for_port(port: u16) -> Vec<serde_json::Value> {
     let mut map = get_responses_request_store().lock().unwrap();
     map.remove(&port).unwrap_or_default()
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn clear_recorded_responses_requests_for_port(port: u16) {
+    let mut map = get_responses_request_store().lock().unwrap();
+    map.remove(&port);
 }
 
 // Minimal rerank handler returning mock results; router shapes final response
