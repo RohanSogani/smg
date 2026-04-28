@@ -36,8 +36,8 @@ use super::{
     accumulator::StreamingResponseAccumulator,
     common::{extract_output_index, get_event_type, parse_sse_block, ChunkProcessor},
     utils::{
-        patch_response_with_request_metadata, response_tool_to_value, restore_original_tools,
-        rewrite_streaming_block,
+        build_persistence_request_body, patch_response_with_request_metadata,
+        response_tool_to_value, restore_original_tools, rewrite_streaming_block,
     },
 };
 const SSE_DONE: &str = "data: [DONE]\n\n";
@@ -561,6 +561,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let should_store = req.client_body.store.unwrap_or(true);
     let client_request = req.client_body;
+    let request_body = req.request_body;
     let previous_response_id = req.previous_response_id;
     let storage = req.storage;
 
@@ -631,12 +632,14 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 );
 
                 // Always persist conversation items and response (even without conversation)
+                let persistence_body =
+                    build_persistence_request_body(&request_body, &client_request);
                 if let Err(err) = persist_conversation_items(
                     storage.conversation.clone(),
                     storage.conversation_item.clone(),
                     storage.response.clone(),
                     &response_json,
-                    &client_request,
+                    &persistence_body,
                     storage.request_context.clone(),
                 )
                 .await
@@ -966,12 +969,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                     );
 
                     // Always persist conversation items and response (even without conversation)
+                    let persistence_body =
+                        build_persistence_request_body(&request_body, &client_request);
                     if let Err(err) = persist_conversation_items(
                         storage.conversation.clone(),
                         storage.conversation_item.clone(),
                         storage.response.clone(),
                         &response_json,
-                        &client_request,
+                        &persistence_body,
                         storage.request_context.clone(),
                     )
                     .await

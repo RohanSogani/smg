@@ -22,6 +22,25 @@ fn is_missing_or_empty(value: Option<&Value>) -> bool {
     }
 }
 
+/// Build the request view used for SMG persistence.
+///
+/// Provider execution uses `request_body` after history loading, bootstrap
+/// injection, `store=false`, and replay sanitization. Persistence needs that
+/// executed input, but it must retain caller-owned metadata such as
+/// `conversation` and `store` from `client_body`.
+pub(super) fn build_persistence_request_body(
+    request_body: &ResponsesRequest,
+    client_body: &ResponsesRequest,
+) -> ResponsesRequest {
+    let mut persistence_body = request_body.clone();
+    persistence_body
+        .conversation
+        .clone_from(&client_body.conversation);
+    persistence_body.store = client_body.store;
+    persistence_body.user.clone_from(&client_body.user);
+    persistence_body
+}
+
 /// Insert a string value into a JSON object if the condition is met
 fn insert_if<F>(obj: &mut Map<String, Value>, key: &str, value: &str, condition: F)
 where

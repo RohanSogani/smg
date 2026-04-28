@@ -11,7 +11,9 @@ use serde_json::Value;
 use smg_mcp::McpToolSession;
 use tracing::warn;
 
-use super::utils::{patch_response_with_request_metadata, restore_original_tools};
+use super::utils::{
+    build_persistence_request_body, patch_response_with_request_metadata, restore_original_tools,
+};
 use crate::routers::{
     common::{
         header_utils::{extract_forwardable_request_headers, ApiProvider},
@@ -173,12 +175,13 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         ctx.components.conversation_item_storage(),
         ctx.components.response_storage(),
     ) {
+        let persistence_body = build_persistence_request_body(request_body, client_body);
         if let Err(err) = persist_conversation_items(
             conv_storage.clone(),
             item_storage.clone(),
             resp_storage.clone(),
             &response_json,
-            client_body,
+            &persistence_body,
             ctx.storage_request_context.clone(),
         )
         .await
