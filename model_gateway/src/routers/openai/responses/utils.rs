@@ -25,21 +25,21 @@ fn is_missing_or_empty(value: Option<&Value>) -> bool {
 /// Build the request view used for SMG persistence.
 ///
 /// Provider execution uses `request_body` after history loading, bootstrap
-/// injection, `store=false`, and replay sanitization. Persistence needs that
-/// executed input, but it must retain caller-owned metadata such as
-/// `conversation`, `previous_response_id`, and `store` from `client_body`.
+/// injection, `store=false`, and replay sanitization. Persistence stores the
+/// caller turn from `client_body` so replay-expanded history and request-scoped
+/// bootstrap/memory context are not persisted into future turns. Other
+/// execution-normalized fields still come from `request_body`, while
+/// caller-owned metadata such as `conversation`, `previous_response_id`, and
+/// `store` are restored from `client_body`.
 pub(super) fn build_persistence_request_body(
     request_body: &ResponsesRequest,
     client_body: &ResponsesRequest,
 ) -> ResponsesRequest {
     let mut persistence_body = request_body.clone();
-    if client_body.conversation.is_some() || client_body.previous_response_id.is_some() {
-        // Persistence should append only the current client turn for stateful
-        // requests. The normalized request body already contains replayed
-        // history; persisting it would relink historical conversation items or
-        // duplicate response-chain context on the next resume.
-        persistence_body.input = client_body.input.clone();
-    }
+    // Persist only the client turn. The normalized request body may contain
+    // replayed history or request-scoped bootstrap context that must not be
+    // stored and replayed again on the next request.
+    persistence_body.input = client_body.input.clone();
     persistence_body
         .conversation
         .clone_from(&client_body.conversation);
@@ -506,6 +506,31 @@ mod tests {
             persistence_body.input,
             ResponseInput::Text(ref text) if text == "current turn"
         ));
+        assert_eq!(persistence_body.store, Some(true));
+    }
+
+    #[test]
+    fn persistence_body_uses_client_input_for_root_request() {
+        let request_body = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: ResponseInput::Items(vec![]),
+            store: Some(false),
+            ..Default::default()
+        };
+        let client_body = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: ResponseInput::Text("root turn".to_string()),
+            store: Some(true),
+            ..Default::default()
+        };
+
+        let persistence_body = build_persistence_request_body(&request_body, &client_body);
+
+        assert!(matches!(
+            persistence_body.input,
+            ResponseInput::Text(ref text) if text == "root turn"
+        ));
+        assert_eq!(persistence_body.previous_response_id, None);
         assert_eq!(persistence_body.store, Some(true));
     }
 
