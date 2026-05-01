@@ -81,6 +81,28 @@ impl McpToolExposureFilter {
     }
 }
 
+struct PreparedMcpToolExposureFilter<'a> {
+    tool_names: Option<HashSet<&'a str>>,
+    read_only: Option<bool>,
+}
+
+impl<'a> PreparedMcpToolExposureFilter<'a> {
+    fn from_filter(filter: &'a McpToolExposureFilter) -> Self {
+        let tool_names = filter.tool_names.as_ref().map(|names| {
+            names
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
+        Self {
+            tool_names,
+            read_only: filter.read_only,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExposedToolBinding {
     // INVARIANT:
@@ -150,14 +172,18 @@ impl<'a> McpToolSession<'a> {
         let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
 
         // Build per-server exposure filters from bindings that specify allowed_tools.
-        let allowed_tools_by_server_key: HashMap<&str, &McpToolExposureFilter> = mcp_servers
-            .iter()
-            .filter_map(|b| {
-                b.allowed_tools
-                    .as_ref()
-                    .map(|filter| (b.server_key.as_str(), filter))
-            })
-            .collect();
+        let allowed_tools_by_server_key: HashMap<&str, PreparedMcpToolExposureFilter<'_>> =
+            mcp_servers
+                .iter()
+                .filter_map(|b| {
+                    b.allowed_tools.as_ref().map(|filter| {
+                        (
+                            b.server_key.as_str(),
+                            PreparedMcpToolExposureFilter::from_filter(filter),
+                        )
+                    })
+                })
+                .collect();
 
         if !allowed_tools_by_server_key.is_empty() {
             mcp_tools.retain(|entry| {
@@ -854,6 +880,9 @@ impl<'a> McpToolSession<'a> {
         for direct_entry in direct_tools {
             if let Some(mut alias_entries) = aliases_by_target.remove(&direct_entry.qualified_name)
             {
+                for alias_entry in &mut alias_entries {
+                    alias_entry.annotations = direct_entry.annotations.clone();
+                }
                 visible_tools.append(&mut alias_entries);
             } else {
                 visible_tools.push(direct_entry);
@@ -875,22 +904,19 @@ impl<'a> McpToolSession<'a> {
             .unwrap_or_else(|| entry.server_key())
     }
 
-    fn matches_allowed_tool_filter(entry: &ToolEntry, filter: &McpToolExposureFilter) -> bool {
+    fn matches_allowed_tool_filter(
+        entry: &ToolEntry,
+        filter: &PreparedMcpToolExposureFilter<'_>,
+    ) -> bool {
         if let Some(read_only) = filter.read_only {
             if entry.annotations.read_only != read_only {
                 return false;
             }
         }
 
-        let Some(allowed_names) = filter.tool_names.as_ref() else {
+        let Some(allowed) = filter.tool_names.as_ref() else {
             return true;
         };
-
-        let allowed: HashSet<&str> = allowed_names
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
 
         allowed.contains(entry.tool_name())
             || entry
@@ -1560,6 +1586,53 @@ mod tests {
         assert!(session.has_exposed_tool("web_search"));
         assert_eq!(session.mcp_tools().len(), 1);
         assert_eq!(session.mcp_tools()[0].tool_name(), "web_search");
+    }
+
+    #[test]
+    fn test_allowed_tools_read_only_filter_uses_alias_target_annotations() {
+        let orchestrator = McpOrchestrator::new_test();
+
+        orchestrator.tool_inventory().insert_entry(
+            ToolEntry::from_server_tool("server1", create_test_tool("brave_web_search"))
+                .with_annotations(ToolAnnotations::new().with_read_only(true)),
+        );
+
+        orchestrator
+            .register_alias(
+                "web_search",
+                "server1",
+                "brave_web_search",
+                None,
+                ResponseFormat::WebSearchCall,
+            )
+            .expect("alias registration should succeed");
+
+        let read_only_session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "brave".to_string(),
+                server_key: "server1".to_string(),
+                allowed_tools: Some(McpToolExposureFilter::read_only(true)),
+            }],
+            "test-request",
+        );
+
+        assert!(read_only_session.has_exposed_tool("web_search"));
+        assert_eq!(read_only_session.mcp_tools().len(), 1);
+        assert_eq!(read_only_session.mcp_tools()[0].tool_name(), "web_search");
+
+        let write_session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "brave".to_string(),
+                server_key: "server1".to_string(),
+                allowed_tools: Some(McpToolExposureFilter::read_only(false)),
+            }],
+            "test-request",
+        );
+
+        assert!(!write_session.has_exposed_tool("web_search"));
+        assert!(write_session.mcp_tools().is_empty());
     }
 
     #[test]
