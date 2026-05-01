@@ -590,17 +590,7 @@ impl ResponseTransformer {
 
     /// Transform to shell_call output.
     fn to_shell_call(tool_call_id: &str, arguments: &str) -> ResponseOutputItem {
-        let action = serde_json::from_str::<ShellCallAction>(arguments).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                "Failed to parse shell_call arguments as ShellCallAction; emitting empty action"
-            );
-            ShellCallAction {
-                commands: Vec::new(),
-                max_output_length: None,
-                timeout_ms: None,
-            }
-        });
+        let action = parse_shell_call_action(arguments);
 
         ResponseOutputItem::ShellCall {
             id: normalize_shell_call_id(tool_call_id),
@@ -610,6 +600,40 @@ impl ResponseTransformer {
             status: ShellCallStatus::Completed,
             created_by: None,
         }
+    }
+}
+
+fn parse_shell_call_action(arguments: &str) -> ShellCallAction {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        warn!("Failed to parse shell_call arguments as JSON; emitting empty action");
+        return empty_shell_call_action();
+    };
+
+    let Some(object) = value.as_object() else {
+        warn!("Expected shell_call arguments to be a JSON object; emitting empty action");
+        return empty_shell_call_action();
+    };
+
+    let action = serde_json::json!({
+        "commands": object.get("commands").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "max_output_length": object.get("max_output_length").cloned().unwrap_or(serde_json::Value::Null),
+        "timeout_ms": object.get("timeout_ms").cloned().unwrap_or(serde_json::Value::Null),
+    });
+
+    serde_json::from_value::<ShellCallAction>(action).unwrap_or_else(|e| {
+        warn!(
+            error = %e,
+            "Failed to parse shell_call action fields; emitting empty action"
+        );
+        empty_shell_call_action()
+    })
+}
+
+fn empty_shell_call_action() -> ShellCallAction {
+    ShellCallAction {
+        commands: Vec::new(),
+        max_output_length: None,
+        timeout_ms: None,
     }
 }
 
@@ -1085,6 +1109,27 @@ mod tests {
                 assert_eq!(action.timeout_ms, Some(1000));
                 assert!(environment.is_none());
                 assert_eq!(status, ShellCallStatus::Completed);
+            }
+            _ => panic!("Expected ShellCall"),
+        }
+    }
+
+    #[test]
+    fn test_shell_call_transform_preserves_action_with_dispatch_metadata() {
+        let transformed = ResponseTransformer::transform(
+            &json!({}),
+            &ResponseFormat::ShellCall,
+            "call-shell-2",
+            "server",
+            "shell",
+            r#"{"commands":["pwd"],"timeout_ms":500,"user":"request-user"}"#,
+        );
+
+        match transformed {
+            ResponseOutputItem::ShellCall { action, .. } => {
+                assert_eq!(action.commands, vec!["pwd"]);
+                assert_eq!(action.timeout_ms, Some(500));
+                assert_eq!(action.max_output_length, None);
             }
             _ => panic!("Expected ShellCall"),
         }
